@@ -1,157 +1,110 @@
-Based on the architecture diagram and your requirements, I'll provide the Terraform code split into separate files as requested. Here's the Infrastructure-as-Code (IaC) implementation using Terraform:
+Based on the architecture diagram provided, here's a Terraform code structure to create the infrastructure as code:
 
-main.tf:
 ```hcl
+# Provider configuration
 provider "aws" {
-  region = var.aws_region
+  region = "us-west-2"  # Replace with your desired region
 }
-```
 
-backend.tf:
-```hcl
-terraform {
-  backend "s3" {
-    bucket = "YOUR_S3_BUCKET_NAME"
-    key    = "terraform/state"
-    region = "us-west-2"
-    encrypt = true
+# VPC and networking (assuming a VPC is needed)
+module "vpc" {
+  source = "terraform-aws-modules/vpc/aws"
+  
+  name = "my-vpc"
+  cidr = "10.0.0.0/16"
+  
+  azs             = ["us-west-2a", "us-west-2b", "us-west-2c"]
+  private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+  public_subnets  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
+  
+  enable_nat_gateway = true
+  single_nat_gateway = true
+}
+
+# S3 bucket
+resource "aws_s3_bucket" "storage_bucket" {
+  bucket = "my-storage-bucket"
+}
+
+# DynamoDB table
+resource "aws_dynamodb_table" "dynamodb_table" {
+  name           = "my-dynamodb-table"
+  billing_mode   = "PAY_PER_REQUEST"
+  hash_key       = "id"
+
+  attribute {
+    name = "id"
+    type = "S"
   }
 }
-```
 
-variables.tf:
-```hcl
-variable "aws_region" {
-  description = "AWS region for resources"
-  default     = "us-west-2"
-}
+# Lambda function
+module "lambda_function" {
+  source = "terraform-aws-modules/lambda/aws"
 
-variable "queue_name" {
-  description = "Name of the SQS FIFO queue"
-  default     = "migration-queue.fifo"
-}
+  function_name = "my-lambda-function"
+  description   = "My Lambda function"
+  handler       = "index.handler"
+  runtime       = "nodejs14.x"
 
-variable "lambda_function_name" {
-  description = "Name of the Lambda function"
-  default     = "migration-lambda"
-}
+  source_path = "../src/lambda"
 
-variable "dynamodb_table_name" {
-  description = "Name of the DynamoDB table"
-  default     = "migration-table"
-}
-```
-
-sqs.tf:
-```hcl
-resource "aws_sqs_queue" "migration_queue" {
-  name                        = var.queue_name
-  fifo_queue                  = true
-  content_based_deduplication = true
-
-  tags = {
-    Name = "Migration Queue"
-  }
-}
-```
-
-lambda.tf:
-```hcl
-resource "aws_lambda_function" "migration_lambda" {
-  filename         = "lambda_function.zip"
-  function_name    = var.lambda_function_name
-  role             = aws_iam_role.lambda_role.arn
-  handler          = "lambda_function.handler"
-  runtime          = "python3.8"
-  timeout          = 900 # 15 minutes
-
-  environment {
-    variables = {
-      DYNAMODB_TABLE = aws_dynamodb_table.migration_table.name
+  attach_policy_statements = true
+  policy_statements = {
+    s3_read = {
+      effect    = "Allow",
+      actions   = ["s3:GetObject"],
+      resources = [aws_s3_bucket.storage_bucket.arn]
+    },
+    dynamodb_read_write = {
+      effect    = "Allow",
+      actions   = ["dynamodb:GetItem", "dynamodb:PutItem"],
+      resources = [aws_dynamodb_table.dynamodb_table.arn]
     }
   }
 }
 
-resource "aws_lambda_event_source_mapping" "sqs_trigger" {
-  event_source_arn = aws_sqs_queue.migration_queue.arn
-  function_name    = aws_lambda_function.migration_lambda.arn
+# API Gateway
+module "api_gateway" {
+  source = "terraform-aws-modules/apigateway-v2/aws"
+
+  name          = "my-api-gateway"
+  description   = "My HTTP API Gateway"
+  protocol_type = "HTTP"
+
+  cors_configuration = {
+    allow_headers = ["content-type", "x-amz-date", "authorization", "x-api-key", "x-amz-security-token", "x-amz-user-agent"]
+    allow_methods = ["*"]
+    allow_origins = ["*"]
+  }
+
+  integrations = {
+    "POST /" = {
+      lambda_arn = module.lambda_function.lambda_function_arn
+    }
+  }
+}
+
+# CloudWatch Logs
+resource "aws_cloudwatch_log_group" "api_gateway_logs" {
+  name = "/aws/api_gateway/${module.api_gateway.apigatewayv2_api_id}"
+
+  retention_in_days = 30
 }
 
 resource "aws_cloudwatch_log_group" "lambda_logs" {
-  name              = "/aws/lambda/${aws_lambda_function.migration_lambda.function_name}"
-  retention_in_days = 14
+  name = "/aws/lambda/${module.lambda_function.lambda_function_name}"
+
+  retention_in_days = 30
 }
 ```
 
-dynamodb.tf:
-```hcl
-resource "aws_dynamodb_table" "migration_table" {
-  name           = var.dynamodb_table_name
-  billing_mode   = "PAY_PER_REQUEST"
-  hash_key       = "migration-id"
+This Terraform code creates the main components shown in the architecture diagram:
 
-  attribute {
-    name = "migration-id"
-    type = "S"
-  }
+1. An S3 bucket for storage
+2. A DynamoDB table
+3. A Lambda function with permissions to access S3 and DynamoDB
+4. An API Gateway to trigger the Lambda function
+5. CloudWatch Logs for both API Gateway and Lambda
 
-  tags = {
-    Name = "Migration Table"
-  }
-}
-```
-
-iam.tf:
-```hcl
-resource "aws_iam_role" "lambda_role" {
-  name = "migration_lambda_role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        }
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "lambda_dynamodb_full_access" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess"
-  role       = aws_iam_role.lambda_role.name
-}
-
-resource "aws_iam_role_policy_attachment" "lambda_sqs_full_access" {
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole"
-  role       = aws_iam_role.lambda_role.name
-}
-
-resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-  role       = aws_iam_role.lambda_role.name
-}
-```
-
-outputs.tf:
-```hcl
-output "sqs_queue_url" {
-  description = "URL of the SQS queue"
-  value       = aws_sqs_queue.migration_queue.url
-}
-
-output "lambda_function_arn" {
-  description = "ARN of the Lambda function"
-  value       = aws_lambda_function.migration_lambda.arn
-}
-
-output "dynamodb_table_name" {
-  description = "Name of the DynamoDB table"
-  value       = aws_dynamodb_table.migration_table.name
-}
-```
-
-This Terraform code creates the necessary resources for the serverless architecture shown in the diagram, including an SQS FIFO queue, a Lambda function, a DynamoDB table, and the required IAM roles and policies. The code is split into separate files for better organization and maintainability.
+The code uses modules where applicable (VPC, Lambda, and API Gateway) to simplify the configuration. You may need to adjust some parameters, such as names and ARNs, to match your specific requirements.

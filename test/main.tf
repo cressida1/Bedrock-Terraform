@@ -1,110 +1,256 @@
-Based on the architecture diagram provided, here's a Terraform code structure to create the infrastructure as code:
+Based on the provided architecture diagram and the requested configuration, here's the Terraform code to create the infrastructure:
 
 ```hcl
-# Provider configuration
 provider "aws" {
-  region = "us-west-2"  # Replace with your desired region
+  region = "us-east-1"
 }
 
-# VPC and networking (assuming a VPC is needed)
-module "vpc" {
-  source = "terraform-aws-modules/vpc/aws"
+resource "aws_vpc" "main" {
+  cidr_block = "10.0.0.0/16"
   
-  name = "my-vpc"
-  cidr = "10.0.0.0/16"
-  
-  azs             = ["us-west-2a", "us-west-2b", "us-west-2c"]
-  private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
-  public_subnets  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
-  
-  enable_nat_gateway = true
-  single_nat_gateway = true
-}
-
-# S3 bucket
-resource "aws_s3_bucket" "storage_bucket" {
-  bucket = "my-storage-bucket"
-}
-
-# DynamoDB table
-resource "aws_dynamodb_table" "dynamodb_table" {
-  name           = "my-dynamodb-table"
-  billing_mode   = "PAY_PER_REQUEST"
-  hash_key       = "id"
-
-  attribute {
-    name = "id"
-    type = "S"
+  tags = {
+    Name = "main-vpc"
   }
 }
 
-# Lambda function
-module "lambda_function" {
-  source = "terraform-aws-modules/lambda/aws"
+resource "aws_subnet" "public" {
+  vpc_id     = aws_vpc.main.id
+  cidr_block = "10.0.1.0/24"
 
-  function_name = "my-lambda-function"
-  description   = "My Lambda function"
+  tags = {
+    Name = "Public Subnet"
+  }
+}
+
+resource "aws_subnet" "private" {
+  vpc_id     = aws_vpc.main.id
+  cidr_block = "10.0.2.0/24"
+
+  tags = {
+    Name = "Private Subnet"
+  }
+}
+
+resource "aws_elastic_beanstalk_application" "migration_ui" {
+  name        = "Migration-UI"
+  description = "Migration UI Application"
+}
+
+resource "aws_elastic_beanstalk_environment" "migration_ui" {
+  name                = "Migration-UI-env"
+  application         = aws_elastic_beanstalk_application.migration_ui.name
+  solution_stack_name = "64bit Amazon Linux 2 v5.6.4 running Node.js 14"
+
+  setting {
+    namespace = "aws:ec2:vpc"
+    name      = "VPCId"
+    value     = aws_vpc.main.id
+  }
+
+  setting {
+    namespace = "aws:ec2:vpc"
+    name      = "Subnets"
+    value     = aws_subnet.private.id
+  }
+
+  setting {
+    namespace = "aws:elasticbeanstalk:environment"
+    name      = "LoadBalancerType"
+    value     = "application"
+  }
+
+  setting {
+    namespace = "aws:ec2:vpc"
+    name      = "ELBSubnets"
+    value     = aws_subnet.public.id
+  }
+
+  setting {
+    namespace = "aws:autoscaling:asg"
+    name      = "MinSize"
+    value     = "1"
+  }
+
+  setting {
+    namespace = "aws:autoscaling:asg"
+    name      = "MaxSize"
+    value     = "1"
+  }
+}
+
+resource "aws_elastic_beanstalk_application" "migration_api" {
+  name        = "Migration-API"
+  description = "Migration API Application"
+}
+
+resource "aws_elastic_beanstalk_environment" "migration_api" {
+  name                = "Migration-API-env"
+  application         = aws_elastic_beanstalk_application.migration_api.name
+  solution_stack_name = "64bit Amazon Linux 2 v2.5.4 running .NET Core"
+
+  setting {
+    namespace = "aws:ec2:vpc"
+    name      = "VPCId"
+    value     = aws_vpc.main.id
+  }
+
+  setting {
+    namespace = "aws:ec2:vpc"
+    name      = "Subnets"
+    value     = aws_subnet.private.id
+  }
+
+  setting {
+    namespace = "aws:elasticbeanstalk:environment"
+    name      = "LoadBalancerType"
+    value     = "application"
+  }
+
+  setting {
+    namespace = "aws:ec2:vpc"
+    name      = "ELBSubnets"
+    value     = aws_subnet.private.id
+  }
+
+  setting {
+    namespace = "aws:autoscaling:asg"
+    name      = "MinSize"
+    value     = "1"
+  }
+
+  setting {
+    namespace = "aws:autoscaling:asg"
+    name      = "MaxSize"
+    value     = "1"
+  }
+}
+
+resource "aws_iam_role" "lambda_role" {
+  name = "lambda_role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
+  role       = aws_iam_role.lambda_role.name
+}
+
+resource "aws_lambda_function" "get_migration_id" {
+  filename      = "get_migration_id.zip"
+  function_name = "GetMigrationId-Lambda"
+  role          = aws_iam_role.lambda_role.arn
   handler       = "index.handler"
-  runtime       = "nodejs14.x"
+  runtime       = "python3.12"
 
-  source_path = "../src/lambda"
-
-  attach_policy_statements = true
-  policy_statements = {
-    s3_read = {
-      effect    = "Allow",
-      actions   = ["s3:GetObject"],
-      resources = [aws_s3_bucket.storage_bucket.arn]
-    },
-    dynamodb_read_write = {
-      effect    = "Allow",
-      actions   = ["dynamodb:GetItem", "dynamodb:PutItem"],
-      resources = [aws_dynamodb_table.dynamodb_table.arn]
-    }
+  vpc_config {
+    subnet_ids         = [aws_subnet.private.id]
+    security_group_ids = [aws_security_group.lambda_sg.id]
   }
 }
 
-# API Gateway
-module "api_gateway" {
-  source = "terraform-aws-modules/apigateway-v2/aws"
+resource "aws_lambda_function" "push_records" {
+  filename      = "push_records.zip"
+  function_name = "PushRecords-Lambda"
+  role          = aws_iam_role.lambda_role.arn
+  handler       = "index.handler"
+  runtime       = "python3.12"
 
-  name          = "my-api-gateway"
-  description   = "My HTTP API Gateway"
-  protocol_type = "HTTP"
-
-  cors_configuration = {
-    allow_headers = ["content-type", "x-amz-date", "authorization", "x-api-key", "x-amz-security-token", "x-amz-user-agent"]
-    allow_methods = ["*"]
-    allow_origins = ["*"]
-  }
-
-  integrations = {
-    "POST /" = {
-      lambda_arn = module.lambda_function.lambda_function_arn
-    }
+  vpc_config {
+    subnet_ids         = [aws_subnet.private.id]
+    security_group_ids = [aws_security_group.lambda_sg.id]
   }
 }
 
-# CloudWatch Logs
-resource "aws_cloudwatch_log_group" "api_gateway_logs" {
-  name = "/aws/api_gateway/${module.api_gateway.apigatewayv2_api_id}"
+resource "aws_security_group" "lambda_sg" {
+  name        = "lambda_sg"
+  description = "Security group for Lambda functions"
+  vpc_id      = aws_vpc.main.id
+}
 
-  retention_in_days = 30
+resource "aws_sfn_state_machine" "migration_flow" {
+  name     = "Migration-Flow"
+  role_arn = aws_iam_role.step_function_role.arn
+
+  definition = jsonencode({
+    StartAt = "GetMigrationId"
+    States = {
+      GetMigrationId = {
+        Type     = "Task"
+        Resource = aws_lambda_function.get_migration_id.arn
+        Next     = "PushRecords"
+      }
+      PushRecords = {
+        Type     = "Task"
+        Resource = aws_lambda_function.push_records.arn
+        End      = true
+      }
+    }
+  })
+}
+
+resource "aws_iam_role" "step_function_role" {
+  name = "step_function_role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "states.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "step_function_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaRole"
+  role       = aws_iam_role.step_function_role.name
+}
+
+resource "aws_cloudwatch_log_group" "eb_ui_logs" {
+  name = "/aws/elasticbeanstalk/Migration-UI-env/var/log/eb-activity.log"
+}
+
+resource "aws_cloudwatch_log_group" "eb_api_logs" {
+  name = "/aws/elasticbeanstalk/Migration-API-env/var/log/eb-activity.log"
 }
 
 resource "aws_cloudwatch_log_group" "lambda_logs" {
-  name = "/aws/lambda/${module.lambda_function.lambda_function_name}"
+  name = "/aws/lambda/GetMigrationId-Lambda"
+}
 
-  retention_in_days = 30
+resource "aws_cloudwatch_log_group" "lambda_logs_2" {
+  name = "/aws/lambda/PushRecords-Lambda"
+}
+
+resource "aws_cloudwatch_log_group" "step_function_logs" {
+  name = "/aws/states/Migration-Flow"
 }
 ```
 
-This Terraform code creates the main components shown in the architecture diagram:
+This Terraform code creates the following resources:
 
-1. An S3 bucket for storage
-2. A DynamoDB table
-3. A Lambda function with permissions to access S3 and DynamoDB
-4. An API Gateway to trigger the Lambda function
-5. CloudWatch Logs for both API Gateway and Lambda
+1. A VPC with public and private subnets
+2. Two Elastic Beanstalk applications and environments (UI and API)
+3. Two Lambda functions
+4. A Step Function
+5. IAM roles and policies
+6. Security groups
+7. CloudWatch log groups for monitoring
 
-The code uses modules where applicable (VPC, Lambda, and API Gateway) to simplify the configuration. You may need to adjust some parameters, such as names and ARNs, to match your specific requirements.
+Note that you'll need to provide the actual Lambda function code in ZIP files for the `aws_lambda_function` resources. Also, you may need to adjust the CIDR blocks, region, and other specific details according to your requirements.

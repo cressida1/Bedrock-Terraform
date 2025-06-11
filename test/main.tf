@@ -1,18 +1,18 @@
-Based on the provided architecture diagram and specifications, here's the Terraform code to create the infrastructure:
+Based on the provided architecture diagram and the specified configuration, here's the Terraform code to create the infrastructure:
 
 ```hcl
 provider "aws" {
   region = "us-east-1"
 }
 
-resource "aws_elastic_beanstalk_application" "ui" {
+resource "aws_elastic_beanstalk_application" "migration_ui" {
   name        = "migration-ui"
-  description = "UI Application"
+  description = "Migration UI Application"
 }
 
-resource "aws_elastic_beanstalk_environment" "ui" {
+resource "aws_elastic_beanstalk_environment" "migration_ui" {
   name                = "migration-ui-env"
-  application         = aws_elastic_beanstalk_application.ui.name
+  application         = aws_elastic_beanstalk_application.migration_ui.name
   solution_stack_name = "64bit Amazon Linux 2 v5.8.0 running Node.js 16"
 
   setting {
@@ -35,19 +35,49 @@ resource "aws_elastic_beanstalk_environment" "ui" {
 
   setting {
     namespace = "aws:elasticbeanstalk:environment"
-    name      = "EnvironmentType"
-    value     = "LoadBalanced"
+    name      = "LoadBalancerType"
+    value     = "application"
+  }
+
+  setting {
+    namespace = "aws:ec2:vpc"
+    name      = "Subnets"
+    value     = join(",", data.aws_subnets.public.ids)
+  }
+
+  setting {
+    namespace = "aws:autoscaling:trigger"
+    name      = "MeasureName"
+    value     = "CPUUtilization"
+  }
+
+  setting {
+    namespace = "aws:autoscaling:trigger"
+    name      = "Statistic"
+    value     = "Average"
+  }
+
+  setting {
+    namespace = "aws:autoscaling:trigger"
+    name      = "Unit"
+    value     = "Percent"
+  }
+
+  setting {
+    namespace = "aws:autoscaling:trigger"
+    name      = "UpperThreshold"
+    value     = "75"
   }
 }
 
-resource "aws_elastic_beanstalk_application" "api" {
+resource "aws_elastic_beanstalk_application" "migration_api" {
   name        = "migration-api"
-  description = "API Application"
+  description = "Migration API Application"
 }
 
-resource "aws_elastic_beanstalk_environment" "api" {
+resource "aws_elastic_beanstalk_environment" "migration_api" {
   name                = "migration-api-env"
-  application         = aws_elastic_beanstalk_application.api.name
+  application         = aws_elastic_beanstalk_application.migration_api.name
   solution_stack_name = "64bit Amazon Linux 2 v5.8.0 running Node.js 16"
 
   setting {
@@ -70,22 +100,24 @@ resource "aws_elastic_beanstalk_environment" "api" {
 
   setting {
     namespace = "aws:elasticbeanstalk:environment"
-    name      = "EnvironmentType"
-    value     = "LoadBalanced"
+    name      = "LoadBalancerType"
+    value     = "application"
+  }
+
+  setting {
+    namespace = "aws:ec2:vpc"
+    name      = "Subnets"
+    value     = join(",", data.aws_subnets.private.ids)
   }
 }
 
-resource "aws_security_group" "api_sg" {
-  name        = "api-sg"
-  description = "Security group for API"
-  vpc_id      = aws_default_vpc.default.id
-
-  ingress {
-    from_port       = 80
-    to_port         = 80
-    protocol        = "tcp"
-    security_groups = [aws_elastic_beanstalk_environment.ui.load_balancers[0]]
-  }
+resource "aws_security_group_rule" "api_ingress" {
+  type                     = "ingress"
+  from_port                = 80
+  to_port                  = 80
+  protocol                 = "tcp"
+  source_security_group_id = aws_elastic_beanstalk_environment.migration_ui.security_group_id
+  security_group_id        = aws_elastic_beanstalk_environment.migration_api.security_group_id
 }
 
 resource "aws_lambda_function" "start_migration" {
@@ -107,7 +139,7 @@ resource "aws_lambda_function" "rollback_migration" {
 }
 
 resource "aws_iam_role" "lambda_role" {
-  name = "lambda_s3_full_access"
+  name = "lambda_s3_access_role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -128,7 +160,7 @@ resource "aws_iam_role_policy_attachment" "lambda_s3_policy" {
   role       = aws_iam_role.lambda_role.name
 }
 
-resource "aws_sfn_state_machine" "migration" {
+resource "aws_sfn_state_machine" "migration_state_machine" {
   name     = "Migration"
   role_arn = aws_iam_role.step_function_role.arn
 
@@ -137,26 +169,20 @@ resource "aws_sfn_state_machine" "migration" {
     States = {
       StartMigration = {
         Type     = "Task"
-        Resource = "arn:aws:states:::lambda:invoke"
-        Parameters = {
-          FunctionName = aws_lambda_function.start_migration.arn
-        }
-        Next = "RollbackMigration"
+        Resource = aws_lambda_function.start_migration.arn
+        Next     = "RollbackMigration"
       }
       RollbackMigration = {
         Type     = "Task"
-        Resource = "arn:aws:states:::lambda:invoke"
-        Parameters = {
-          FunctionName = aws_lambda_function.rollback_migration.arn
-        }
-        End = true
+        Resource = aws_lambda_function.rollback_migration.arn
+        End      = true
       }
     }
   })
 }
 
 resource "aws_iam_role" "step_function_role" {
-  name = "step_function_lambda_full_access"
+  name = "step_function_lambda_role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -177,61 +203,47 @@ resource "aws_iam_role_policy_attachment" "step_function_lambda_policy" {
   role       = aws_iam_role.step_function_role.name
 }
 
-resource "aws_route53_zone" "main" {
-  name = "test.com"
+data "aws_route53_zone" "selected" {
+  name = "test.com."
 }
 
-resource "aws_route53_record" "ui" {
-  zone_id = aws_route53_zone.main.zone_id
-  name    = "ui.test.com"
+resource "aws_route53_record" "migration_ui" {
+  zone_id = data.aws_route53_zone.selected.zone_id
+  name    = "migration-ui.test.com"
   type    = "A"
 
   alias {
-    name                   = aws_elastic_beanstalk_environment.ui.cname
-    zone_id                = aws_elastic_beanstalk_environment.ui.load_balancers[0]
+    name                   = aws_elastic_beanstalk_environment.migration_ui.cname
+    zone_id                = aws_elastic_beanstalk_environment.migration_ui.zone_id
     evaluate_target_health = true
   }
 }
 
-resource "aws_default_vpc" "default" {
-  tags = {
-    Name = "Default VPC"
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "public" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+  filter {
+    name   = "map-public-ip-on-launch"
+    values = ["true"]
   }
 }
 
-resource "aws_default_subnet" "default_az1" {
-  availability_zone = "us-east-1a"
-}
-
-resource "aws_default_subnet" "default_az2" {
-  availability_zone = "us-east-1b"
-}
-
-resource "aws_autoscaling_policy" "ui_cpu_policy" {
-  name                   = "ui-cpu-policy"
-  autoscaling_group_name = aws_elastic_beanstalk_environment.ui.autoscaling_groups[0]
-  adjustment_type        = "ChangeInCapacity"
-  scaling_adjustment     = 1
-  cooldown               = 300
-  policy_type            = "SimpleScaling"
-}
-
-resource "aws_cloudwatch_metric_alarm" "ui_cpu_alarm" {
-  alarm_name          = "ui-cpu-alarm"
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  evaluation_periods  = "2"
-  metric_name         = "CPUUtilization"
-  namespace           = "AWS/EC2"
-  period              = "120"
-  statistic           = "Average"
-  threshold           = "75"
-  alarm_description   = "This metric monitors EC2 CPU utilization"
-  alarm_actions       = [aws_autoscaling_policy.ui_cpu_policy.arn]
-
-  dimensions = {
-    AutoScalingGroupName = aws_elastic_beanstalk_environment.ui.autoscaling_groups[0]
+data "aws_subnets" "private" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+  filter {
+    name   = "map-public-ip-on-launch"
+    values = ["false"]
   }
 }
 ```
 
-This Terraform code creates the infrastructure based on the provided architecture diagram and specifications. It includes Elastic Beanstalk applications for UI and API, Lambda functions, Step Function, Route53 configuration, and auto-scaling policies. Note that some aspects, like specific EC2 instance configurations, may need to be adjusted based on your exact requirements.
+This Terraform code creates the infrastructure based on the provided architecture diagram and configuration. It includes Elastic Beanstalk applications for the UI and API, Lambda functions, Step Functions, Route 53 record, and necessary IAM roles and policies. The code uses the default VPC and subnets as specified in the configuration.

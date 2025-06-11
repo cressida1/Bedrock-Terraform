@@ -1,4 +1,4 @@
-Based on the provided architecture diagram and the specified configuration, here's the Terraform code to create the infrastructure:
+Based on the architecture diagram and the provided configuration, here's the Terraform code to create the infrastructure:
 
 ```hcl
 provider "aws" {
@@ -10,10 +10,10 @@ resource "aws_elastic_beanstalk_application" "migration_ui" {
   description = "Migration UI Application"
 }
 
-resource "aws_elastic_beanstalk_environment" "migration_ui" {
+resource "aws_elastic_beanstalk_environment" "migration_ui_env" {
   name                = "migration-ui-env"
   application         = aws_elastic_beanstalk_application.migration_ui.name
-  solution_stack_name = "64bit Amazon Linux 2 v5.8.0 running Node.js 16"
+  solution_stack_name = "64bit Amazon Linux 2 v5.8.0 running Node.js 14"
 
   setting {
     namespace = "aws:autoscaling:launchconfiguration"
@@ -30,7 +30,7 @@ resource "aws_elastic_beanstalk_environment" "migration_ui" {
   setting {
     namespace = "aws:autoscaling:asg"
     name      = "MaxSize"
-    value     = "2"
+    value     = "1"
   }
 
   setting {
@@ -44,30 +44,6 @@ resource "aws_elastic_beanstalk_environment" "migration_ui" {
     name      = "Subnets"
     value     = join(",", data.aws_subnets.public.ids)
   }
-
-  setting {
-    namespace = "aws:autoscaling:trigger"
-    name      = "MeasureName"
-    value     = "CPUUtilization"
-  }
-
-  setting {
-    namespace = "aws:autoscaling:trigger"
-    name      = "Statistic"
-    value     = "Average"
-  }
-
-  setting {
-    namespace = "aws:autoscaling:trigger"
-    name      = "Unit"
-    value     = "Percent"
-  }
-
-  setting {
-    namespace = "aws:autoscaling:trigger"
-    name      = "UpperThreshold"
-    value     = "75"
-  }
 }
 
 resource "aws_elastic_beanstalk_application" "migration_api" {
@@ -75,10 +51,10 @@ resource "aws_elastic_beanstalk_application" "migration_api" {
   description = "Migration API Application"
 }
 
-resource "aws_elastic_beanstalk_environment" "migration_api" {
+resource "aws_elastic_beanstalk_environment" "migration_api_env" {
   name                = "migration-api-env"
   application         = aws_elastic_beanstalk_application.migration_api.name
-  solution_stack_name = "64bit Amazon Linux 2 v5.8.0 running Node.js 16"
+  solution_stack_name = "64bit Amazon Linux 2 v5.8.0 running Node.js 14"
 
   setting {
     namespace = "aws:autoscaling:launchconfiguration"
@@ -95,7 +71,7 @@ resource "aws_elastic_beanstalk_environment" "migration_api" {
   setting {
     namespace = "aws:autoscaling:asg"
     name      = "MaxSize"
-    value     = "2"
+    value     = "1"
   }
 
   setting {
@@ -111,13 +87,13 @@ resource "aws_elastic_beanstalk_environment" "migration_api" {
   }
 }
 
-resource "aws_security_group_rule" "api_ingress" {
+resource "aws_security_group_rule" "allow_ui_to_api" {
   type                     = "ingress"
   from_port                = 80
   to_port                  = 80
   protocol                 = "tcp"
-  source_security_group_id = aws_elastic_beanstalk_environment.migration_ui.security_group_id
-  security_group_id        = aws_elastic_beanstalk_environment.migration_api.security_group_id
+  source_security_group_id = aws_elastic_beanstalk_environment.migration_ui_env.security_group_id
+  security_group_id        = aws_elastic_beanstalk_environment.migration_api_env.security_group_id
 }
 
 resource "aws_lambda_function" "start_migration" {
@@ -169,13 +145,19 @@ resource "aws_sfn_state_machine" "migration_state_machine" {
     States = {
       StartMigration = {
         Type     = "Task"
-        Resource = aws_lambda_function.start_migration.arn
-        Next     = "RollbackMigration"
+        Resource = "arn:aws:states:::lambda:invoke"
+        Parameters = {
+          FunctionName = aws_lambda_function.start_migration.arn
+        }
+        Next = "RollbackMigration"
       }
       RollbackMigration = {
         Type     = "Task"
-        Resource = aws_lambda_function.rollback_migration.arn
-        End      = true
+        Resource = "arn:aws:states:::lambda:invoke"
+        Parameters = {
+          FunctionName = aws_lambda_function.rollback_migration.arn
+        }
+        End = true
       }
     }
   })
@@ -213,8 +195,8 @@ resource "aws_route53_record" "migration_ui" {
   type    = "A"
 
   alias {
-    name                   = aws_elastic_beanstalk_environment.migration_ui.cname
-    zone_id                = aws_elastic_beanstalk_environment.migration_ui.zone_id
+    name                   = aws_elastic_beanstalk_environment.migration_ui_env.cname
+    zone_id                = aws_elastic_beanstalk_environment.migration_ui_env.cname_zone_id
     evaluate_target_health = true
   }
 }
@@ -244,6 +226,32 @@ data "aws_subnets" "private" {
     values = ["false"]
   }
 }
+
+resource "aws_autoscaling_policy" "migration_ui_cpu_policy" {
+  name                   = "migration-ui-cpu-policy"
+  autoscaling_group_name = aws_elastic_beanstalk_environment.migration_ui_env.autoscaling_groups[0]
+  policy_type            = "TargetTrackingScaling"
+
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ASGAverageCPUUtilization"
+    }
+    target_value = 75.0
+  }
+}
+
+resource "aws_autoscaling_policy" "migration_api_cpu_policy" {
+  name                   = "migration-api-cpu-policy"
+  autoscaling_group_name = aws_elastic_beanstalk_environment.migration_api_env.autoscaling_groups[0]
+  policy_type            = "TargetTrackingScaling"
+
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ASGAverageCPUUtilization"
+    }
+    target_value = 75.0
+  }
+}
 ```
 
-This Terraform code creates the infrastructure based on the provided architecture diagram and configuration. It includes Elastic Beanstalk applications for the UI and API, Lambda functions, Step Functions, Route 53 record, and necessary IAM roles and policies. The code uses the default VPC and subnets as specified in the configuration.
+This Terraform code creates the infrastructure based on the provided architecture diagram and configuration. It includes Elastic Beanstalk applications for the UI and API, Lambda functions, Step Functions, Route 53 records, and auto-scaling policies. The code uses the default VPC and subnets, and sets up the necessary IAM roles and security group rules.
